@@ -1,0 +1,17 @@
+numpy
+pandas
+matplotlib
+seaborn
+rasterio
+scikit-image
+scikit-learn
+PyYAML
+torch
+albumentations
+opencv-python
+geopandas
+shapely
+tqdm
+segmentation-models-pytorch
+tensorboard
+monai

@@ -1,0 +1,46 @@
+name: dyneo-segmentation
+
+services:
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+
+    image: dyneo/segmentation-inference:latest
+    container_name: dyneo_inference
+
+    working_dir: /workspace/segmentation
+
+    stdin_open: true
+    tty: true
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: /data/hf
+      HF_HUB_CACHE: /data/hf/hub
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      TORCH_HOME: /home/appuser/.cache/torch
+      TORCHINDUCTOR_CACHE_DIR: /home/appuser/.cache/torchinductor
+      MPLBACKEND: "Agg"
+
+    volumes:
+      - ./storage_read:/workspace/segmentation/storage_read:ro
+      - ./storage_write:/workspace/segmentation/storage_write:rw
+      - ./hf_cache:/data/hf
+
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./app
+          target: /workspace/segmentation
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
