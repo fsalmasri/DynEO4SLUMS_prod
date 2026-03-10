@@ -1,28 +1,49 @@
 # DynEO Segmentation Inference Docker Guide
 
-This guide explains how to build, run, and use the segmentation inference app in Docker.
+DynEO Segmentation Inference is a Python-based application for running semantic segmentation on Sentinel-2 satellite imagery. It leverages deep learning models to detect and analyze changes in land cover, supporting multi-temporal aggregation and trend analysis. The app is designed to run efficiently in a Docker container with GPU acceleration.
 
-## Prerequisites
-- Docker and Docker Compose installed
-- NVIDIA GPU and drivers (for GPU support)
-- Project structure as shown in this repository
 
-## Folder Structure
-- `docker/` — Docker files and instructions
-- `storage_read/` — Input data (read-only)
-- `storage_write/` — Output/results (read-write)
-- `hf_cache/` — HuggingFace cache (optional)
-- `app/` — Main inference code
+## Features
 
-## Build the Docker Image
+- **Satellite Segmentation**: Uses a UNet architecture with MobileNetV2 encoder for pixel-wise classification.
+- **Multi-band Input**: Processes both 10m and 20m resolution bands from Sentinel-2.
+- **Temporal Aggregation**: Aggregates predictions across multiple dates, computes persistence, trend, and disagreement maps.
+- **Confidence Analysis**: Outputs confidence-weighted maps and appearance statistics.
+- **Geospatial Output**: Results are saved as GeoTIFFs, PNGs, and GeoPackages (GPKG) for easy GIS integration.
+- **Interactive CLI**: Allows users to select files or folders for inference and aggregation.
 
-From the `docker/` directory:
+## Project Structure
+
+- `app/` — Main Python code for CLI, inference, aggregation, and utilities.
+- `storage_read/` — Input directory (read-only), expected to contain Sentinel-2 TIFFs and GPKG files.
+- `storage_write/` — Output directory (read-write), where results are saved.
+- `hf_cache/` — HuggingFace cache for model downloads (optional).
+- `Dockerfile` — Multi-stage build for efficient containerization.
+- `docker-compose.yml` — Service definition for running the app with GPU support.
+
+## Input Requirements
+
+- Sentinel-2 imagery split into `_10m_clipped.tif` and `_20m_clipped.tif` files.
+- Presence and absence GeoPackage files for each date (optional for aggregation).
+- Files should be placed in `storage_read/samples/`.
+
+
+## Installation
+
+### Prerequisites
+
+- Docker and Docker Compose
+- NVIDIA GPU and drivers (for CUDA support)
+
+### Build the Docker Image
+
+From the project root:
 
 ```bash
 docker compose build
 ```
 
-## Run the Inference App
+### Run the Inference App
 
 Start the container interactively:
 
@@ -30,24 +51,43 @@ Start the container interactively:
 docker compose run --rm --build inference
 ```
 
-This will launch the app in `/workspace/segmentation`.
+## Usage
 
-## Using the CLI
+### CLI Workflow
 
-Once inside the container, you can use the CLI to run inference:
+- Place your input files in `storage_read/samples/`.
+- At the prompt, enter the relative path to a TIFF file, prefix, or folder name.
+- The app will check for required files, run inference, and save results to `storage_write/`.
+- For folders, the app aggregates results across dates and generates summary maps.
 
-1. Place your input files in `storage_read/samples/`.
-2. At the prompt, enter the relative path to a TIFF file or folder (e.g. `S2A_MSIL2A_20161104T054842_10m_clipped.tif` or the prefix `S2A_MSIL2A_20161104T054842` or a folder name).
-3. Results will be written to `storage_write/`.
 
-## GPU Support
+### Output
 
-The container is configured for NVIDIA GPU. Make sure you have the NVIDIA Container Toolkit installed.
+- **GeoTIFFs**: Georeferenced raster outputs including segmentation masks, confidence maps, persistence maps, confidence-weighted persistence, first appearance, last appearance, confidence trend, prediction trend, and disagreement maps.
 
-## Troubleshooting
-- Ensure input files are named correctly and both `_10m_clipped.tif` and `_20m_clipped.tif` exist for each sample.
-- Check logs for errors.
-- For HuggingFace models, cache is mounted at `/data/hf`.
+- **PNGs**: Visualizations of the generated rasters with UTM coordinate axes, titles, and legends for quick inspection.
+
+- **GeoPackages (GPKG)**: Vectorized presence and absence polygons derived from the segmentation results, suitable for use in GIS tools.
+- 
+### Technical Details
+
+- **Model**: UNet with MobileNetV2 encoder, loaded from checkpoint.
+- **Frameworks**: PyTorch, rasterio, geopandas, matplotlib.
+- **Aggregation**: Computes persistence, confidence-weighted persistence, first/last appearance, trend, and disagreement maps.
+- **Docker**: Multi-stage build for reproducibility and performance. GPU support via NVIDIA Container Toolkit.
+
+
+
+### Troubleshooting
+
+- Ensure both `_10m_clipped.tif` and `_20m_clipped.tif` exist for each sample.
+- Check logs for missing files or errors.
+- GPU must be available and accessible to the container.
+
+### License
+
+This project is intended for research and internal use. See `LICENSE` for details.
+
 
 ## Example Workflow
 1. Place your Sentinel-2 files in `storage_read/samples/`.
@@ -57,12 +97,11 @@ The container is configured for NVIDIA GPU. Make sure you have the NVIDIA Contai
 
 ## Stopping the App
 
-Press `Ctrl+C` or run:
+Press `Ctrl+C`, type `exist` or run:
 
 ```bash
 docker compose down
 ```
 
----
-For advanced usage, see the comments in `docker-compose.yml` and the app code.
+
 
