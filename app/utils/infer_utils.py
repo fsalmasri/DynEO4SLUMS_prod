@@ -3,6 +3,16 @@ import csv
 import numpy as np
 from pathlib import Path
 
+try:
+    from scipy.ndimage import gaussian_filter1d
+except Exception:
+    gaussian_filter1d = None
+
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from matplotlib.colors import ListedColormap, BoundaryNorm
+
 import torch
 
 import rasterio
@@ -11,6 +21,27 @@ from rasterio.features import shapes as rio_shapes
 from rasterio.features import rasterize
 from shapely.geometry import shape, box
 import geopandas as gpd
+
+
+def _as_uint8(x):
+    return x.astype(np.uint8, copy=False)
+
+def _stack_preds(preds):
+    # shape (T,H,W)
+    return np.stack([_as_uint8(p) for p in preds], axis=0)
+
+def _stack_confs(confs):
+    # shape (T,H,W)
+    return np.stack([_as_float32(c) for c in confs], axis=0)
+
+def _as_float32(x):
+    return x.astype(np.float32, copy=False)
+
+
+def _parse_date_to_int(date_str: str) -> int:
+    # accepts "YYYYMMDD" or "YYYY-MM-DD"
+    s = date_str.replace("-", "")
+    return int(s[:8])
 
 
 def confusion_map(pred, label, ignore_value=255):
@@ -85,8 +116,6 @@ def load_bands(TEN_M, TWENTY_M):
     stack = np.concatenate([ten, up], axis=0).astype("float32")  # (10,H,W)
 
     return stack, transform, crs, rbounds
-
-
 
 def load_s2_rgb_and_labels(
         path_tif: Path,
@@ -391,3 +420,536 @@ def save_confidence_geotiff(conf_map, meta, output_path):
         transform=meta["transform"],
     ) as dst:
         dst.write(conf_np, 1)
+
+
+
+def save_map(
+    array,
+    meta,
+    output_path_base,
+    dtype=None,
+    cmap=None,
+    mode="auto",
+    discrete_max_unique=50,
+    nodata_value=None,
+    title=None,
+    legend_title=None,
+    num_ticks=5,
+):
+    """
+    Save raster as GeoTIFF and PNG with proper UTM axes, title and legend.
+
+    Parameters
+    ----------
+    array : np.ndarray
+        2D array to save.
+    meta : dict
+        Must contain: H, W, crs, transform
+    output_path_base : str
+        Path without extension.
+    dtype : str or None
+        Output dtype for GeoTIFF.
+    cmap : str or matplotlib colormap
+        Colormap.
+    mode : {"auto","discrete","continuous","trend"}
+        Visualization mode.
+    nodata_value : scalar or None
+        Value treated as background in PNG.
+    title : str
+        Figure title.
+    legend_title : str
+        Title for colorbar / legend.
+    """
+
+    array = np.asarray(array)
+    H, W = array.shape
+    transform = meta["transform"]
+
+    if dtype is None:
+        dtype = str(array.dtype)
+
+    out_name = str(output_path_base).lower()
+
+    # ----------------------------
+    # Decide mode
+    # ----------------------------
+    is_integer_array = np.issubdtype(array.dtype, np.integer)
+
+    finite_vals = array[np.isfinite(array)] if np.issubdtype(array.dtype, np.floating) else array.ravel()
+    unique_vals = np.unique(finite_vals)
+
+    if mode == "auto":
+        if "trend" in out_name:
+            mode = "trend"
+        elif "persistence" in out_name or "first_appearance" in out_name:
+            mode = "discrete"
+        elif is_integer_array and len(unique_vals) <= discrete_max_unique:
+            mode = "discrete"
+        else:
+            mode = "continuous"
+
+    # ----------------------------
+    # Choose colormap
+    # ----------------------------
+    if cmap is None:
+        if mode == "trend":
+            cmap = "RdBu_r"
+        elif mode == "discrete":
+            cmap = "tab20"
+        else:
+            cmap = "viridis"
+
+    # ----------------------------
+    # Save GeoTIFF
+    # ----------------------------
+    with rasterio.open(
+        str(output_path_base) + ".tif",
+        "w",
+        driver="GTiff",
+        height=H,
+        width=W,
+        count=1,
+        dtype=dtype,
+        crs=meta["crs"],
+        transform=transform,
+        nodata=nodata_value,
+    ) as dst:
+        dst.write(array.astype(dtype), 1)
+
+    # ----------------------------
+    # Compute map extent
+    # ----------------------------
+    left = transform.c
+    top = transform.f
+    right = left + transform.a * W
+    bottom = top + transform.e * H
+
+    extent = [left, right, bottom, top]
+
+    # ----------------------------
+    # Prepare plotting array
+    # ----------------------------
+    plot_array = array.astype(float)
+
+    if nodata_value is not None:
+        plot_array = np.ma.masked_where(array == nodata_value, plot_array)
+
+    # ----------------------------
+    # Plot
+    # ----------------------------
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    if mode == "discrete":
+
+        im = ax.imshow(
+            plot_array,
+            cmap=cmap,
+            extent=extent,
+            origin="upper",
+            interpolation="nearest",
+        )
+
+        ticks = unique_vals
+        cbar = fig.colorbar(im, ax=ax, ticks=ticks)
+
+        labels = []
+        for v in ticks:
+            if nodata_value is not None and v == nodata_value:
+                labels.append("Never")
+            else:
+                labels.append(str(int(v)))
+
+        cbar.ax.set_yticklabels(labels)
+
+    elif mode == "trend":
+
+        vmax = np.nanpercentile(np.abs(array), 99)
+        if vmax == 0:
+            vmax = 1e-6
+
+        im = ax.imshow(
+            plot_array,
+            cmap=cmap,
+            extent=extent,
+            origin="upper",
+            vmin=-vmax,
+            vmax=vmax,
+        )
+
+        cbar = fig.colorbar(im, ax=ax)
+
+    else:
+
+        im = ax.imshow(
+            plot_array,
+            cmap=cmap,
+            extent=extent,
+            origin="upper",
+        )
+
+        cbar = fig.colorbar(im, ax=ax)
+
+    # ----------------------------
+    # Legend title
+    # ----------------------------
+    if legend_title is not None:
+        cbar.set_label(legend_title)
+
+    # ----------------------------
+    # Axis formatting
+    # ----------------------------
+    ax.set_xlabel("UTM Easting")
+    ax.set_ylabel("UTM Northing")
+
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(num_ticks))
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(num_ticks))
+
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
+
+    # ----------------------------
+    # Title
+    # ----------------------------
+    if title is not None:
+        ax.set_title(title, fontsize=14, pad=10)
+
+    plt.tight_layout()
+    plt.savefig(str(output_path_base) + ".png", dpi=200)
+    plt.close()
+
+def save_categorical_year_map(
+    array,
+    output_path_base,
+    title=None,
+    legend_title="Year"
+):
+    """
+    Save a categorical year map (e.g. first or last appearance).
+
+    Parameters
+    ----------
+    array : np.ndarray
+        2D array containing:
+            0 -> never
+            YYYYMMDD -> appearance date
+    output_path_base : str or Path
+        Output path without extension.
+    title : str, optional
+        Figure title.
+    legend_title : str
+        Title for the colorbar legend.
+    """
+
+    unique_vals = np.unique(array)
+    unique_vals = unique_vals[unique_vals != 0]  # exclude "never"
+
+    years = sorted(unique_vals)
+
+    # categories: index -> value
+    categories = [0] + years
+
+    # build colormap
+    colors = ["lightgray"] + plt.get_cmap("tab10")(np.linspace(0, 1, len(years))).tolist()
+    cmap = ListedColormap(colors)
+
+    norm = BoundaryNorm(np.arange(len(categories) + 1) - 0.5, len(categories))
+
+    # map values -> category index
+    mapped = np.zeros_like(array, dtype=int)
+    for i, val in enumerate(categories):
+        mapped[array == val] = i
+
+    # plotting
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    im = ax.imshow(mapped, cmap=cmap, norm=norm)
+    ax.axis("off")
+
+    # title
+    if title is not None:
+        ax.set_title(title, fontsize=14, pad=10)
+
+    # colorbar
+    cbar = fig.colorbar(im, ax=ax, ticks=np.arange(len(categories)))
+
+    labels = ["Never"] + [str(y)[:4] for y in years]
+    cbar.ax.set_yticklabels(labels)
+
+    if legend_title is not None:
+        cbar.set_label(legend_title)
+
+    fig.tight_layout()
+    fig.savefig(str(output_path_base) + ".png", dpi=200)
+    plt.close(fig)
+
+
+def disagreement_map(preds, ignore_value=255):
+    """
+    Pixel value = disagreement rate across time.
+    Defined as: 1 - |2p-1| where p = fraction of ones among valid timesteps.
+    - p=0 or 1 -> 0 disagreement (stable)
+    - p=0.5 -> 1 disagreement (max)
+    Output range [0,1].
+    """
+    p = persistence_map(preds, ignore_value=ignore_value, normalize=True)  # fraction ones
+    return (1.0 - np.abs(2.0 * p - 1.0)).astype(np.float32)
+
+def persistence_map(preds, ignore_value=255, normalize=True):
+    """
+    Pixel value = how many times it was predicted as 1 across all timesteps.
+    Output is integer count of positive predictions per pixel.
+    """
+    P = _stack_preds(preds)  # (T,H,W)
+    valid = (P != ignore_value)
+    ones = (P == 1) & valid
+
+    count_ones = np.sum(ones, axis=0).astype(np.int32)
+    return count_ones
+
+def trend_map(
+    values_over_time,
+    dates=None,
+    ignore_mask=None,
+    smoothing_sigma=1.0,
+    min_valid=2,
+    normalize_time=True,
+    slope_threshold=0.08,
+    delta_threshold=0.15,
+    confidence_threshold=0.40,
+    clamp_range=(-1.0, 1.0),
+    return_debug=False,
+):
+    """
+    Compute a pixel-wise temporal trend map from a sequence of confidence maps.
+
+    This function fits a linear trend independently for each pixel across time
+    and returns the regression slope as a 2D map.
+
+    Main steps
+    ----------
+    1. Stack the input maps into a (T, H, W) array.
+    2. Optionally mask invalid pixels at each timestamp using `ignore_mask`.
+    3. Optionally smooth each pixel time series along the temporal axis while
+       respecting NaN / ignored values.
+    4. Compute a per-pixel least-squares linear slope using only valid
+       timestamps for that pixel.
+    5. Remove unreliable or weak trends using:
+       - minimum number of valid observations
+       - minimum absolute slope
+       - minimum net confidence change from first valid to last valid
+       - minimum mean confidence
+    6. Optionally clip extreme slope values.
+
+    Parameters
+    ----------
+    values_over_time : list of ndarray
+        List of 2D arrays with shape (H, W). Each array is typically a
+        confidence map for one timestamp.
+    dates : list, optional
+        List of dates corresponding to each time step. If None, uses
+        evenly spaced time values [0, 1, ..., T-1].
+        Dates are parsed with `_parse_date_to_int`.
+    ignore_mask : list of ndarray, optional
+        List of boolean arrays with shape (H, W). True means that pixel should
+        be ignored at that timestamp.
+    smoothing_sigma : float or None, default=1.0
+        Standard deviation of the Gaussian smoothing applied along the temporal
+        axis only. Set to 0 or None to disable smoothing.
+    min_valid : int, default=2
+        Minimum number of valid timestamps required to compute a meaningful
+        trend for a pixel.
+    normalize_time : bool, default=True
+        If True, normalize the time vector to [0, 1]. In that case, the slope
+        is approximately interpretable as total confidence change across the
+        full observed period.
+        If False, slope is expressed per raw time unit returned by
+        `_parse_date_to_int` (typically days).
+    slope_threshold : float, default=0.05
+        Absolute slope threshold below which the trend is set to 0. This helps
+        remove weak noisy trends.
+    delta_threshold : float, default=0.10
+        Minimum absolute net confidence change required between the first valid
+        and the last valid timestamp for a pixel to keep its trend.
+    confidence_threshold : float or None, default=0.30
+        Minimum mean confidence across valid timestamps required to keep the
+        trend. Set to None to disable this filter.
+    clamp_range : tuple(float, float) or None, default=(-1.0, 1.0)
+        Optional range used to clip slope values after filtering. Set to None
+        to disable clipping.
+    return_debug : bool, default=False
+        If True, return a tuple:
+            (slope_map, debug_dict)
+
+    Returns
+    -------
+    slope : ndarray of shape (H, W), dtype float32
+        Pixel-wise trend map.
+        - Positive values: confidence increases over time
+        - Negative values: confidence decreases over time
+        - Zero: no reliable / meaningful trend after filtering
+
+    Debug dictionary keys (if return_debug=True)
+    --------------------------------------------
+    smoothed_values : ndarray, shape (T, H, W)
+        Final temporal stack used for regression, after masking and smoothing.
+    valid_count : ndarray, shape (H, W)
+        Number of valid timestamps per pixel.
+    time_vector : ndarray, shape (T,)
+        Time vector used for the regression.
+    variance : ndarray, shape (H, W)
+        Per-pixel temporal variance of the time variable over valid timestamps.
+    delta : ndarray, shape (H, W)
+        Net confidence change from first valid to last valid timestamp.
+    mean_confidence : ndarray, shape (H, W)
+        Mean confidence over valid timestamps.
+
+    Notes
+    -----
+    - Persistence and trend are different quantities:
+      persistence measures how often a pixel is positive,
+      trend measures whether confidence is increasing or decreasing over time.
+    - This function is intended for continuous confidence maps, not only binary
+      masks.
+    - Filtering weak slopes and weak net changes is recommended to suppress
+      confidence jitter and produce a cleaner trend map.
+    """
+    if len(values_over_time) < 2:
+        raise ValueError("Need at least 2 time steps.")
+
+    V_list = [_as_float32(v) for v in values_over_time]
+    shapes = [v.shape for v in V_list]
+    if len(set(shapes)) != 1:
+        raise ValueError(f"All maps must have the same shape, got: {shapes}")
+
+    V = np.stack(V_list, axis=0)  # (T, H, W)
+    T, H, W = V.shape
+
+    # ------------------------------------------------------------------
+    # Build time vector
+    # ------------------------------------------------------------------
+    if dates is None:
+        t = np.arange(T, dtype=np.float32)
+    else:
+        if len(dates) != T:
+            raise ValueError(f"len(dates)={len(dates)} must match T={T}")
+        t = np.array([_parse_date_to_int(d) for d in dates], dtype=np.float32)
+
+    if normalize_time:
+        dt = float(t.max() - t.min())
+        if dt > 0:
+            t = (t - t.min()) / dt
+        else:
+            t = np.zeros_like(t, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Apply ignore mask
+    # ------------------------------------------------------------------
+    if ignore_mask is not None:
+        if len(ignore_mask) != T:
+            raise ValueError(f"len(ignore_mask)={len(ignore_mask)} must match T={T}")
+        M = np.stack([np.asarray(m, dtype=bool) for m in ignore_mask], axis=0)
+        if M.shape != V.shape:
+            raise ValueError(f"ignore_mask stacked shape {M.shape} must match V shape {V.shape}")
+        V = np.where(M, np.nan, V)
+
+    # ------------------------------------------------------------------
+    # Optional temporal smoothing while respecting NaNs
+    # ------------------------------------------------------------------
+    if smoothing_sigma is not None and smoothing_sigma > 0:
+        if gaussian_filter1d is None:
+            raise ImportError(
+                "scipy is required for temporal smoothing. "
+                "Install scipy or set smoothing_sigma=0."
+            )
+
+        valid = np.isfinite(V).astype(np.float32)
+        V_filled = np.nan_to_num(V, nan=0.0)
+
+        # Smooth numerator and denominator separately
+        V_num = gaussian_filter1d(V_filled, sigma=smoothing_sigma, axis=0, mode="nearest")
+        V_den = gaussian_filter1d(valid, sigma=smoothing_sigma, axis=0, mode="nearest")
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            V = V_num / np.maximum(V_den, 1e-8)
+
+        # Restore unsupported locations as NaN
+        V[V_den <= 1e-6] = np.nan
+
+    # ------------------------------------------------------------------
+    # Per-pixel regression using only valid timestamps for each pixel
+    # ------------------------------------------------------------------
+    t2 = t[:, None, None]          # (T, 1, 1)
+    valid = np.isfinite(V)         # (T, H, W)
+    n = valid.sum(axis=0).astype(np.float32)
+
+    safe_n = np.maximum(n, 1.0)
+
+    t_sum = np.sum(np.where(valid, t2, 0.0), axis=0)
+    v_sum = np.sum(np.where(valid, V, 0.0), axis=0)
+
+    t_mean = t_sum / safe_n
+    v_mean = v_sum / safe_n
+
+    cov = np.sum(np.where(valid, (t2 - t_mean) * (V - v_mean), 0.0), axis=0) / safe_n
+    var = np.sum(np.where(valid, (t2 - t_mean) ** 2, 0.0), axis=0) / safe_n
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        slope = cov / np.maximum(var, 1e-8)
+
+    # ------------------------------------------------------------------
+    # Compute first-valid / last-valid net change per pixel
+    # ------------------------------------------------------------------
+    has_valid = valid.any(axis=0)
+
+    first_idx = np.argmax(valid, axis=0)                    # first True along time
+    last_idx = T - 1 - np.argmax(valid[::-1], axis=0)       # last True along time
+
+    first_vals = np.take_along_axis(V, first_idx[None, :, :], axis=0)[0]
+    last_vals = np.take_along_axis(V, last_idx[None, :, :], axis=0)[0]
+
+    delta = last_vals - first_vals
+    delta = np.where(has_valid, delta, np.nan)
+
+    # Mean confidence over valid timestamps
+    mean_conf = np.nanmean(V, axis=0)
+
+    # ------------------------------------------------------------------
+    # Filtering and cleanup
+    # ------------------------------------------------------------------
+    slope = slope.astype(np.float32)
+
+    # Remove unreliable pixels
+    slope[n < min_valid] = 0.0
+
+    # Remove numerical issues
+    slope = np.nan_to_num(slope, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Remove weak noisy trends
+    if slope_threshold is not None and slope_threshold > 0:
+        slope[np.abs(slope) < slope_threshold] = 0.0
+
+    # Remove weak net confidence change
+    if delta_threshold is not None and delta_threshold > 0:
+        slope[np.abs(np.nan_to_num(delta, nan=0.0)) < delta_threshold] = 0.0
+
+    # Remove trends in very low-confidence regions
+    if confidence_threshold is not None:
+        slope[np.nan_to_num(mean_conf, nan=0.0) < confidence_threshold] = 0.0
+
+    # Optional clamp
+    if clamp_range is not None:
+        slope = np.clip(slope, clamp_range[0], clamp_range[1])
+
+    slope = slope.astype(np.float32)
+
+    if return_debug:
+        return slope, {
+            "smoothed_values": V,
+            "valid_count": n,
+            "time_vector": t,
+            "variance": var.astype(np.float32),
+            "delta": delta.astype(np.float32),
+            "mean_confidence": mean_conf.astype(np.float32),
+        }
+
+    return slope

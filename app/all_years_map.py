@@ -6,41 +6,12 @@ import matplotlib.pyplot as plt
 import geopandas as gpd
 from rasterio.features import rasterize
 
+from utils.infer_utils import save_map, save_categorical_year_map, persistence_map, disagreement_map
+from utils.infer_utils import trend_map
 
-def _as_float32(x):
-    return x.astype(np.float32, copy=False)
 
-def _as_uint8(x):
-    return x.astype(np.uint8, copy=False)
+from utils.infer_utils import _stack_preds, _stack_confs, _parse_date_to_int
 
-def _parse_date_to_int(date_str: str) -> int:
-    # accepts "YYYYMMDD" or "YYYY-MM-DD"
-    s = date_str.replace("-", "")
-    return int(s[:8])
-
-def _stack_preds(preds):
-    # shape (T,H,W)
-    return np.stack([_as_uint8(p) for p in preds], axis=0)
-
-def _stack_confs(confs):
-    # shape (T,H,W)
-    return np.stack([_as_float32(c) for c in confs], axis=0)
-
-def persistence_map(preds, ignore_value=255, normalize=True):
-    """
-    Pixel value = how many times it was predicted as 1 across all timesteps.
-    If normalize=True -> output in [0,1] as fraction of valid timesteps.
-    """
-    P = _stack_preds(preds)  # (T,H,W)
-    valid = (P != ignore_value)
-    ones = (P == 1) & valid
-
-    count_valid = valid.sum(axis=0).astype(np.float32)
-    count_ones = ones.sum(axis=0).astype(np.float32)
-
-    if normalize:
-        return np.divide(count_ones, np.maximum(count_valid, 1.0), dtype=np.float32)
-    return count_ones.astype(np.float32)
 
 
 def confidence_weighted_persistence_map(preds, confs, ignore_value=255):
@@ -111,50 +82,6 @@ def last_appearance_map(preds, dates, confs=None, conf_thr=None, ignore_value=25
     return out
 
 
-def trend_map(values_over_time, dates=None, ignore_mask=None):
-    """
-    Pixel-wise linear trend slope over time.
-    - values_over_time: list of (H,W) arrays (binary preds or continuous conf)
-    - dates: optional list of date strings. If None -> use 0..T-1 as time.
-    - ignore_mask: optional list of boolean masks (H,W) per time, True=ignore
-    Returns slope map (float32). Positive = increasing over time.
-    """
-    V = np.stack([_as_float32(v) for v in values_over_time], axis=0)  # (T,H,W)
-    T, H, W = V.shape
-
-    if dates is None:
-        t = np.arange(T, dtype=np.float32)
-    else:
-        t = np.array([_parse_date_to_int(d) for d in dates], dtype=np.float32)
-        t = (t - t.min()) / max((t.max() - t.min()), 1.0)  # normalize time to ~[0,1]
-
-    if ignore_mask is not None:
-        M = np.stack(ignore_mask, axis=0).astype(bool)  # (T,H,W)
-        V = np.where(M, np.nan, V)
-
-    # slope = cov(t, V) / var(t) computed per pixel ignoring NaNs
-    t2 = t.reshape(T, 1, 1)
-    t_mean = np.nanmean(t2 * np.ones_like(V), axis=0)
-    v_mean = np.nanmean(V, axis=0)
-
-    cov = np.nanmean((t2 - t_mean) * (V - v_mean), axis=0)
-    var = np.nanmean((t2 - t_mean) ** 2, axis=0)
-    slope = cov / np.maximum(var, 1e-8)
-    slope = np.nan_to_num(slope, nan=0.0).astype(np.float32)
-    return slope
-
-
-def disagreement_map(preds, ignore_value=255):
-    """
-    Pixel value = disagreement rate across time.
-    Defined as: 1 - |2p-1| where p = fraction of ones among valid timesteps.
-    - p=0 or 1 -> 0 disagreement (stable)
-    - p=0.5 -> 1 disagreement (max)
-    Output range [0,1].
-    """
-    p = persistence_map(preds, ignore_value=ignore_value, normalize=True)  # fraction ones
-    return (1.0 - np.abs(2.0 * p - 1.0)).astype(np.float32)
-
 
 def load_date_folders(res_path: Path):
     """
@@ -209,79 +136,6 @@ def read_confidence_and_meta(conf_tif: Path):
         }
     return conf, meta
 
-
-def save_map(array, meta, output_path_base, dtype="float32", cmap="viridis"):
-    """
-    output_path_base: Path without extension
-    Will save:
-        output_path_base.tif
-        output_path_base.png
-    """
-
-    # ---- Save GeoTIFF ----
-    arr = array.astype(dtype)
-
-    with rasterio.open(
-        str(output_path_base) + ".tif",
-        "w",
-        driver="GTiff",
-        height=meta["H"],
-        width=meta["W"],
-        count=1,
-        dtype=dtype,
-        crs=meta["crs"],
-        transform=meta["transform"],
-    ) as dst:
-        dst.write(arr, 1)
-
-    # ---- Save PNG preview ----
-    plt.figure(figsize=(6, 6))
-    plt.imshow(array, cmap=cmap)
-    plt.colorbar()
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(str(output_path_base) + ".png", dpi=200)
-    plt.close()
-
-
-def save_categorical_year_map(array, output_path_base):
-    """
-    array contains:
-      0 (never)
-      YYYYMMDD values for appearance dates
-    """
-    from matplotlib.colors import ListedColormap, BoundaryNorm
-    unique_vals = np.unique(array)
-    unique_vals = unique_vals[unique_vals != 0]  # exclude 0
-
-    years = sorted(unique_vals)
-
-    # Add 0 as first category
-    categories = [0] + years
-
-    # Create discrete colormap
-    # colors = ["lightgray"] + plt.cm.tab10(np.linspace(0, 1, len(years))).tolist()
-    colors = ["lightgray"] + plt.get_cmap('tab10')(np.linspace(0, 1, len(years))).tolist()
-    cmap = ListedColormap(colors)
-
-    norm = BoundaryNorm(np.arange(len(categories)+1)-0.5, len(categories))
-
-    # Map original values to category index
-    mapped = np.zeros_like(array, dtype=int)
-    for i, val in enumerate(categories):
-        mapped[array == val] = i
-
-    plt.figure(figsize=(6, 6))
-    im = plt.imshow(mapped, cmap=cmap, norm=norm)
-    plt.axis("off")
-
-    cbar = plt.colorbar(im, ticks=np.arange(len(categories)))
-    labels = ["Never"] + [str(y)[:4] for y in years]
-    cbar.ax.set_yticklabels(labels)
-
-    plt.tight_layout()
-    plt.savefig(str(output_path_base) + ".png", dpi=200)
-    plt.close()
 
 def compose_abs_pres_labels(
     presence_gpkg: Path,
@@ -342,13 +196,105 @@ def compose_abs_pres_labels(
     return mask
 
 
+def claculate_and_save(out_path, dates, preds_yearly, confs_yearly, meta0):
+    # Filter dates to only include valid date strings (YYYYMMDD)
+    filtered_dates = [d for d in dates if re.fullmatch(r"\d{8}", d)]
+    # Filter preds and confs to match filtered_dates
+    filtered_indices = [i for i, d in enumerate(dates) if d in filtered_dates]
+    filtered_preds = [preds_yearly[i] for i in filtered_indices]
+    filtered_confs = [confs_yearly[i] for i in filtered_indices]
+
+    pers = persistence_map(filtered_preds, normalize=True)
+    pers_w = confidence_weighted_persistence_map(filtered_preds, filtered_confs)
+    first = first_appearance_map(filtered_preds, filtered_dates, confs=filtered_confs, conf_thr=0.7)
+    last = last_appearance_map(filtered_preds, filtered_dates, confs=filtered_confs, conf_thr=0.7)
+    trend_conf = trend_map(filtered_confs, dates=filtered_dates)
+
+    # --- Restore trend_pred and dis calculations ---
+    trend_pred = trend_map(
+        [(p == 1).astype(np.float32) for p in filtered_preds],
+        dates=filtered_dates,
+        smoothing_sigma=0.0,
+        slope_threshold=0.15,
+        delta_threshold=0.5,
+        confidence_threshold=None,
+    )
+
+    dis = disagreement_map(filtered_preds)
+
+    save_map(
+        pers,
+        meta0,
+        out_path / "persistence",
+        dtype="int32",
+        mode="discrete",
+        title="Prediction Persistence",
+        legend_title="Number of detections"
+    )
+
+    save_map(
+        pers_w,
+        meta0,
+        out_path / "confidence_weighted_persistence",
+        dtype="float32",
+        mode="continuous",
+        cmap="plasma",
+        title="Confidence-Weighted Persistence",
+        legend_title="Weighted persistence"
+    )
+
+    save_categorical_year_map(
+        first,
+        out_path / "first_appearance",
+        title="First Appearance of Prediction",
+        legend_title="Year"
+    )
+
+    save_categorical_year_map(
+        last,
+        out_path / "last_appearance",
+        title="Last Appearance of Prediction",
+        legend_title="Year"
+    )
+
+    save_map(
+        trend_conf,
+        meta0,
+        out_path / "trend_confidence",
+        dtype="float32",
+        mode="trend",
+        cmap="coolwarm",
+        title="Confidence Trend",
+        legend_title="Trend slope"
+    )
+
+    save_map(
+        trend_pred,
+        meta0,
+        out_path / "trend_prediction",
+        dtype="float32",
+        mode="trend",
+        cmap="coolwarm",
+        title="Prediction Trend",
+        legend_title="Trend slope"
+    )
+
+    save_map(
+        dis,
+        meta0,
+        out_path / "disagreement",
+        dtype="float32",
+        mode="discrete",
+        cmap="magma",
+        title="Prediction Disagreement",
+        legend_title="Disagreement score"
+    )
 
 def aggregate_years(res_path):
 
-    print(res_path)
+    print(f"Aggregating years started...")
     records = load_date_folders(res_path)
-    print('Records loaded')
-
+    print(f'Records loaded with {len(records)}')
 
     aggregation_path = res_path / "aggregation"
     aggregation_path.mkdir(parents=True, exist_ok=True)
@@ -383,27 +329,13 @@ def aggregate_years(res_path):
             print(f"No valid data founded, skipping aggregation.")
             continue
 
+    claculate_and_save(aggregation_path, dates, preds_yearly, confs_yearly, meta0)
 
-    # --- Compute all-years maps for this city ---
-    pers = persistence_map(preds_yearly, normalize=True)
-    pers_w = confidence_weighted_persistence_map(preds_yearly, confs_yearly)
-    first = first_appearance_map(preds_yearly, dates, confs=confs_yearly, conf_thr=0.7)
-    last  = last_appearance_map(preds_yearly, dates, confs=confs_yearly, conf_thr=0.7)
-    trend_conf = trend_map(confs_yearly, dates=dates)
+    # Generate pairs of consecutive filtered dates (YYYYMMDD)
+    date_pairs = [(dates[i], dates[i+1]) for i in range(len(dates)-1)]
+    print(f"{len(date_pairs)} Consecutive date pairs for city: {date_pairs}")
+    for date_pair in date_pairs:
+        couple_dir = aggregation_path / f"{date_pair[0]}_{date_pair[1]}"
+        couple_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Robustness: clip and mask trend_conf ---
-    std_conf_map = np.std(np.stack(confs_yearly, axis=0), axis=0)
-    trend_conf = np.clip(trend_conf, -1, 1)
-    trend_conf[std_conf_map < 0.01] = 0  # Set trend to zero if confidence is nearly constant
-
-    # --- Restore trend_pred and dis calculations ---
-    trend_pred = trend_map([(p == 1).astype(np.float32) for p in preds_yearly], dates=dates)
-    dis = disagreement_map(preds_yearly)
-
-    save_map(pers, meta0, aggregation_path / "persistence", dtype="float32", cmap="viridis")
-    save_map(pers_w, meta0, aggregation_path / "confidence_weighted_persistence", dtype="float32", cmap="plasma")
-    save_categorical_year_map(first, aggregation_path / "first_appearance")
-    save_categorical_year_map(last,  aggregation_path / "last_appearance")
-    save_map(trend_conf, meta0, aggregation_path / "trend_confidence", dtype="float32", cmap="coolwarm")
-    save_map(trend_pred, meta0, aggregation_path / "trend_prediction", dtype="float32", cmap="coolwarm")
-    save_map(dis, meta0, aggregation_path / "disagreement", dtype="float32", cmap="magma")
+        claculate_and_save(couple_dir, date_pair, preds_yearly, confs_yearly, meta0)
