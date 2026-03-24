@@ -151,6 +151,23 @@ if __name__ == "__main__":
 
     if sys.stdin.isatty():
         # Interactive mode
+        # Ask the user to give the index for those channels [1,2,3,4,5,6,10]
+        print("Default required channel indices are: [B2,B3,B4,B5,B6,B7,B12]")
+        user_channels = input("Enter the indices for the channels to use as a comma-separated list (e.g., 1,2,3,4,5,6,10), or press Enter to use default: ").strip()
+        if user_channels:
+            try:
+                channels = [int(idx) for idx in user_channels.split(',') if idx.strip().isdigit()]
+                if not channels:
+                    print("No valid indices entered. Using default channels: [1,2,3,4,5,6,10]")
+                    channels = [1,2,3,4,5,6,10]
+            except Exception as e:
+                print(f"Error parsing input: {e}. Using default channels: [1,2,3,4,5,6,10]")
+                channels = [1,2,3,4,5,6,10]
+        else:
+            channels = [1,2,3,4,5,6,10]
+        cfg["channels"] = channels
+        print(f"Using channel indices: {channels}")
+
         while True:
             user_input = input("Enter the relative path to a TIFF file or folder inside storage_read (or 'exit' to quit): ").strip()
             if user_input.lower() == 'exit':
